@@ -5,6 +5,7 @@ import socket
 import sys
 import ssl
 import time
+import hashlib
 from typing import Any, Dict, List, Optional
 
 # =============================
@@ -35,6 +36,185 @@ def le_hex_to_be_hex(hex_str: str) -> str:
 
 def pretty_json(obj: Any) -> str:
     return json.dumps(obj, indent=2, sort_keys=True)
+
+
+# =============================
+#  Helpers base58 / bech32 / scripts
+# =============================
+
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+def b58encode(b: bytes) -> str:
+    n_zeros = len(b) - len(b.lstrip(b"\0"))
+    num = int.from_bytes(b, "big")
+    res = ""
+    while num > 0:
+        num, rem = divmod(num, 58)
+        res = ALPHABET[rem] + res
+    return "1" * n_zeros + res
+
+
+def b58check_encode(payload: bytes) -> str:
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return b58encode(payload + checksum)
+
+
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+def bech32_polymod(values):
+    GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for v in values:
+        b = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ v
+        for i in range(5):
+            if (b >> i) & 1:
+                chk ^= GEN[i]
+    return chk
+
+
+def bech32_hrp_expand(hrp):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def bech32_create_checksum(hrp, data):
+    values = bech32_hrp_expand(hrp) + data
+    polymod = bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ 1
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+
+def bech32_encode(hrp, data):
+    combined = data + bech32_create_checksum(hrp, data)
+    return hrp + "1" + "".join(CHARSET[d] for d in combined)
+
+
+def convertbits(data, frombits, tobits, pad=True):
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    max_acc = (1 << (frombits + tobits - 1)) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = ((acc << frombits) | value) & max_acc
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+
+def encode_segwit_address(hrp: str, witver: int, witprog: bytes) -> str:
+    data = [witver] + convertbits(list(witprog), 8, 5, True)
+    return bech32_encode(hrp, data)
+
+
+def script_to_address(script_hex: str, network: str = "main") -> Optional[str]:
+    """
+    Tente de décoder les scripts de type :
+      - P2PKH
+      - P2SH
+      - P2WPKH / P2WSH (v0)
+      - P2TR (v1)
+    Retourne l'adresse string ou None si non géré.
+    """
+    try:
+        script = bytes.fromhex(script_hex)
+    except ValueError:
+        return None
+
+    # P2PKH : OP_DUP OP_HASH160 0x14 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    if (
+        len(script) == 25
+        and script[0] == 0x76
+        and script[1] == 0xA9
+        and script[2] == 0x14
+        and script[-2] == 0x88
+        and script[-1] == 0xAC
+    ):
+        h160 = script[3:23]
+        prefix = b"\x00" if network == "main" else b"\x6F"  # mainnet / testnet
+        return b58check_encode(prefix + h160)
+
+    # P2SH : OP_HASH160 0x14 <20 bytes> OP_EQUAL
+    if len(script) == 23 and script[0] == 0xA9 and script[1] == 0x14 and script[-1] == 0x87:
+        h160 = script[2:22]
+        prefix = b"\x05" if network == "main" else b"\xC4"
+        return b58check_encode(prefix + h160)
+
+    # P2WPKH / P2WSH (v0) : 0x00 0x14/0x20 <prog>
+    if len(script) in (22, 34) and script[0] == 0x00 and script[1] in (0x14, 0x20):
+        witver = 0
+        witprog = script[2:]
+        hrp = "bc" if network == "main" else "tb"
+        return encode_segwit_address(hrp, witver, witprog)
+
+    # P2TR (v1) : OP_1 0x20 <32-byte>
+    if len(script) == 34 and script[0] == 0x51 and script[1] == 0x20:
+        witver = 1
+        witprog = script[2:]
+        hrp = "bc" if network == "main" else "tb"
+        return encode_segwit_address(hrp, witver, witprog)
+
+    return None
+
+
+def read_varint(b: bytes, offset: int):
+    prefix = b[offset]
+    if prefix < 0xFD:
+        return prefix, offset + 1
+    elif prefix == 0xFD:
+        return int.from_bytes(b[offset + 1 : offset + 3], "little"), offset + 3
+    elif prefix == 0xFE:
+        return int.from_bytes(b[offset + 1 : offset + 5], "little"), offset + 5
+    else:
+        return int.from_bytes(b[offset + 1 : offset + 9], "little"), offset + 9
+
+
+def parse_tx_outputs(tx_hex: str):
+    """
+    Parse une transaction (y compris format segwit) et renvoie la liste des sorties :
+      [(value_satoshis, scriptPubKey_hex), ...]
+    """
+    data = bytes.fromhex(tx_hex)
+    offset = 0
+
+    # version
+    if len(data) < 4:
+        raise ValueError("TX trop courte")
+    offset += 4
+
+    # segwit marker/flag ?
+    if offset + 2 <= len(data) and data[offset] == 0x00 and data[offset + 1] != 0x00:
+        offset += 2  # on ignore le marker/flag, on n'utilise pas les witness ici
+
+    # inputs
+    n_inputs, offset = read_varint(data, offset)
+    for _ in range(n_inputs):
+        offset += 32  # prev txid
+        offset += 4   # prev vout
+        script_len, offset = read_varint(data, offset)
+        offset += script_len
+        offset += 4  # sequence
+
+    # outputs
+    n_outputs, offset = read_varint(data, offset)
+    outputs = []
+    for _ in range(n_outputs):
+        value = int.from_bytes(data[offset : offset + 8], "little")
+        offset += 8
+        script_len, offset = read_varint(data, offset)
+        script = data[offset : offset + script_len]
+        offset += script_len
+        outputs.append((value, script.hex()))
+
+    return outputs
 
 
 # =============================
@@ -224,6 +404,36 @@ def decode_notify(params: List[Any], extranonce1: Optional[str], extranonce2_siz
 
     print("Coinbase reconstruite par le mineur :")
     print("    coinbase = coinb1 + extranonce1 + extranonce2 + coinb2\n")
+
+    # ============================
+    # Reconstruction + décodage
+    # ============================
+    if extranonce1 is None or extranonce2_size is None:
+        print("[!] Impossible de reconstruire la coinbase (extranonce1 ou extranonce2_size manquants).")
+        print("\n============================================================\n")
+        return
+
+    try:
+        fake_extranonce2 = "00" * extranonce2_size
+        coinbase_hex = coinb1 + extranonce1 + fake_extranonce2 + coinb2
+        print("[+] Coinbase (avec extranonce2 factice remplie de 00) :")
+        print(f"    {coinbase_hex}\n")
+
+        outputs = parse_tx_outputs(coinbase_hex)
+        print("[+] Sorties de la transaction coinbase :")
+        for idx, (value_sat, script_hex) in enumerate(outputs):
+            btc = value_sat / 1e8
+            addr = script_to_address(script_hex, network="main")
+            print(f"  vout[{idx}] : {btc:.8f} BTC")
+            print(f"    scriptPubKey : {script_hex}")
+            if addr:
+                print(f"    adresse      : {addr}")
+            else:
+                print(f"    adresse      : <type de script non géré>")
+        print()
+    except Exception as e:
+        print(f"[!] Erreur lors du décodage de la coinbase : {e}")
+
     print("============================================================\n")
 
 
